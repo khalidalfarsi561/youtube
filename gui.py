@@ -22,6 +22,8 @@ class AutomationConfig:
     cookies_path: str = "cookies.json"
     gemini_api_key: str = ""
     headless: bool = False
+    use_ai: bool = True
+    manual_comment: str = ""
 
 
 class QueueLogger(logging.Handler):
@@ -46,7 +48,6 @@ class AutomationController:
         self._pause_event.set()
         self._on_done = on_done
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._current_task: Optional[asyncio.Task] = None
 
     @property
     def is_running(self) -> bool:
@@ -61,8 +62,8 @@ class AutomationController:
     def stop(self) -> None:
         self._stop_event.set()
         self._pause_event.set()
-        if self._loop and self._loop.is_running() and self._current_task:
-            self._loop.call_soon_threadsafe(self._current_task.cancel)
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(lambda: None)
 
     def start(self, config: AutomationConfig) -> None:
         if self.is_running:
@@ -104,12 +105,16 @@ class AutomationController:
         if config.gemini_api_key:
             os.environ["GEMINI_API_KEY"] = config.gemini_api_key
             os.environ["GENAI_API_KEY"] = config.gemini_api_key
-            yt_commenter.os.environ["GEMINI_API_KEY"] = config.gemini_api_key
 
-        title = await yt_commenter.fetch_video_title(video_urls[0])
-        comment_text = await yt_commenter.generate_comment(title)
-        if not comment_text:
-            raise RuntimeError("Gemini did not return a usable comment.")
+        if config.use_ai:
+            title = await yt_commenter.fetch_video_title(video_urls[0])
+            comment_text = await yt_commenter.generate_comment(title)
+            if not comment_text:
+                raise RuntimeError("Gemini did not return a usable comment.")
+        else:
+            comment_text = config.manual_comment.strip()
+            if not comment_text:
+                raise RuntimeError("Manual comment cannot be empty when AI is disabled.")
 
         async with yt_commenter.async_playwright() as p:
             browser = await p.chromium.launch(headless=config.headless)
@@ -123,8 +128,11 @@ class AutomationController:
                         raise asyncio.CancelledError()
                     while not self._pause_event.is_set():
                         await asyncio.sleep(0.2)
-                    current_title = await yt_commenter.fetch_video_title(video_url)
-                    current_comment = await yt_commenter.generate_comment(current_title) or comment_text
+                    if config.use_ai:
+                        current_title = await yt_commenter.fetch_video_title(video_url)
+                        current_comment = await yt_commenter.generate_comment(current_title) or comment_text
+                    else:
+                        current_comment = comment_text
                     await yt_commenter.comment_on_video(page, video_url, current_comment)
                 logging.info("All comments processed.")
             finally:
@@ -169,12 +177,15 @@ class GuiApp(ctk.CTk):
 
         self.video_urls: list[str] = self._load_urls()
         self.gemini_key_var = ctk.StringVar(value=self._read_env_key())
-        self.cookies_path_var = ctk.StringVar(value="cookies.json")
-        self.headless_var = ctk.BooleanVar(value=False)
+        self.cookies_path_var = ctk.StringVar(value=self._read_settings().get("cookies_path", "cookies.json"))
+        self.headless_var = ctk.BooleanVar(value=bool(self._read_settings().get("headless", False)))
+        self.use_ai_var = ctk.BooleanVar(value=bool(self._read_settings().get("use_ai", True)))
         self.status_var = ctk.StringVar(value="Ready")
         self.url_var = ctk.StringVar()
+        self.manual_comment_var = ctk.StringVar(value=self._read_settings().get("manual_comment", ""))
 
         self._build_ui()
+        self._sync_manual_state()
         self.after(100, self._poll_logs)
 
     def _setup_logger(self) -> None:
@@ -200,6 +211,24 @@ class GuiApp(ctk.CTk):
                     return line.split("=", 1)[1].strip()
         return os.getenv("GEMINI_API_KEY", "")
 
+    def _read_settings(self) -> dict:
+        path = Path("gui_settings.json")
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_settings(self) -> None:
+        payload = {
+            "cookies_path": self.cookies_path_var.get().strip() or "cookies.json",
+            "headless": bool(self.headless_var.get()),
+            "use_ai": bool(self.use_ai_var.get()),
+            "manual_comment": self.manual_comment_textbox.get("1.0", "end").strip(),
+        }
+        Path("gui_settings.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
     def _save_env_key(self, value: str) -> None:
         env_path = Path(".env")
         lines: list[str] = []
@@ -218,6 +247,7 @@ class GuiApp(ctk.CTk):
         env_path.write_text("\n".join(new_lines).strip() + "\n", encoding="utf-8")
         os.environ["GEMINI_API_KEY"] = value
         messagebox.showinfo("Saved", "Gemini API key saved to .env")
+        self._log("INFO", "Gemini API key saved to .env")
 
     def _build_ui(self) -> None:
         sidebar = ctk.CTkFrame(self, corner_radius=18)
@@ -242,6 +272,15 @@ class GuiApp(ctk.CTk):
 
         self.headless_switch = ctk.CTkSwitch(sidebar, text="Headless Mode", variable=self.headless_var)
         self.headless_switch.pack(anchor="w", padx=18, pady=(0, 18))
+
+        self.use_ai_switch = ctk.CTkSwitch(sidebar, text="Use AI", variable=self.use_ai_var, command=self._sync_manual_state)
+        self.use_ai_switch.pack(anchor="w", padx=18, pady=(0, 12))
+
+        ctk.CTkLabel(sidebar, text="Manual Comment").pack(anchor="w", padx=18)
+        self.manual_comment_textbox = ctk.CTkTextbox(sidebar, width=320, height=110, corner_radius=14)
+        self.manual_comment_textbox.pack(padx=18, pady=(6, 8), fill="both")
+        if self.manual_comment_var.get().strip():
+            self.manual_comment_textbox.insert("1.0", self.manual_comment_var.get())
 
         ctk.CTkLabel(sidebar, text="Gemini API Key").pack(anchor="w", padx=18)
         self.key_entry = ctk.CTkEntry(sidebar, textvariable=self.gemini_key_var, show="•", width=300)
@@ -270,6 +309,12 @@ class GuiApp(ctk.CTk):
         self.log_box.tag_config("ERROR", foreground="#ff5b5b")
         self.log_box.tag_config("DEBUG", foreground="#8ab4ff")
 
+    def _sync_manual_state(self) -> None:
+        state = "disabled" if self.use_ai_var.get() else "normal"
+        self.manual_comment_textbox.configure(state=state)
+        if self.use_ai_var.get():
+            self.manual_comment_textbox.delete("1.0", "end")
+
     def _render_urls(self) -> None:
         self.urls_listbox.delete("1.0", "end")
         for idx, url in enumerate(self.video_urls, start=1):
@@ -294,21 +339,32 @@ class GuiApp(ctk.CTk):
         path = filedialog.askopenfilename(filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")])
         if path:
             self.cookies_path_var.set(path)
+            self._save_settings()
             self._log("INFO", f"Selected cookies file: {path}")
 
     def _start(self) -> None:
         if not self.video_urls:
             messagebox.showerror("Error", "Add at least one YouTube URL first.")
             return
+
+        use_ai = bool(self.use_ai_var.get())
+        manual_comment = self.manual_comment_textbox.get("1.0", "end").strip()
+        if not use_ai and not manual_comment:
+            messagebox.showerror("Error", "Manual comment cannot be empty when AI is disabled.")
+            return
+
         config = AutomationConfig(
             video_urls=list(self.video_urls),
             cookies_path=self.cookies_path_var.get().strip() or "cookies.json",
             gemini_api_key=self.gemini_key_var.get().strip(),
             headless=bool(self.headless_var.get()),
+            use_ai=use_ai,
+            manual_comment=manual_comment,
         )
         try:
             self.controller.start(config)
             self.status_var.set("Running")
+            self._save_settings()
             self._log("INFO", "Automation started.")
         except Exception as exc:
             messagebox.showerror("Start failed", str(exc))
@@ -322,6 +378,7 @@ class GuiApp(ctk.CTk):
 
     def _stop(self) -> None:
         self.controller.stop()
+        self._save_settings()
         self.status_var.set("Stopping")
         self._log("WARNING", "Stopping automation...")
 
