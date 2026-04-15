@@ -1,0 +1,6 @@
+.env
+cookies.json
+videos.txt
+__pycache__/
+*.pyc
+debug_error.png
