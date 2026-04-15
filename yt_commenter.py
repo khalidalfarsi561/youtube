@@ -119,8 +119,8 @@ async def generate_comment(title: str) -> Optional[str]:
     return None
 
 
-async def add_cookies(context) -> None:
-    cookies_data = load_json_file("cookies.json")
+async def add_cookies(context, cookies_path: str = "cookies.json") -> None:
+    cookies_data = load_json_file(cookies_path)
     cookies: List[Dict[str, Any]] = []
     for cookie in cookies_data:
         cookies.append(
@@ -219,10 +219,13 @@ async def comment_on_video(page, video_url: str, comment_text: str) -> None:
     return
 
 
-async def main() -> None:
+async def main(headless: bool = False, cookies_path: str = "cookies.json", video_urls: Optional[List[str]] = None, gemini_api_key: Optional[str] = None) -> None:
     setup_logging()
     load_dotenv()
-    video_urls = load_video_urls()
+    if gemini_api_key:
+        os.environ["GEMINI_API_KEY"] = gemini_api_key
+    if video_urls is None:
+        video_urls = load_video_urls()
     video_url = random.choice(video_urls)
     browser = None
 
@@ -235,10 +238,10 @@ async def main() -> None:
         logging.info("Generated comment: %s", comment_text)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=headless)
             context = await browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
             # Stealth disabled due to package API mismatch; keeping headless/user-agent/viewport/cookies only.
-            await add_cookies(context)
+            await add_cookies(context, cookies_path)
             page = await context.new_page()
             try:
                 await comment_on_video(page, video_url, comment_text)
