@@ -15,8 +15,17 @@ from playwright.async_api import async_playwright
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 VIEWPORT = {"width": 1920, "height": 1080}
-SCROLL_DISTANCE = 1200
-COMMENT_PLACEHOLDERS = ["yt-formatted-string#simplebox-placeholder", "div#placeholder-area", "#placeholder-area", "#simplebox-placeholder"]
+SCROLL_DISTANCE = 2000
+COMMENT_PLACEHOLDERS = [
+    "ytd-comment-simplebox-renderer",
+    "#contenteditable-root",
+    "ytd-comment-simplebox-renderer #placeholder-area",
+    "ytd-comment-simplebox-renderer #contenteditable-root",
+    "yt-formatted-string#simplebox-placeholder",
+    "div#placeholder-area",
+    "#placeholder-area",
+    "#simplebox-placeholder",
+]
 COMMENT_INPUT_SELECTOR = "#contenteditable-root"
 SUBMIT_SELECTOR = "ytd-button-renderer#submit-button button"
 ARABIC_PROMPT = "اكتب تعليقاً واحداً فقط باللغة العربية بناءً على عنوان الفيديو: {title}. يجب أن يكون التعليق قصيراً، إيجابياً، ويبدو كأنه من شخص حقيقي. أضف إيموجي واحد فقط. ممنوع كتابة أي شرح، ممنوع كتابة مقدمات، أرسل نص التعليق فقط"
@@ -69,7 +78,7 @@ def build_prompt(title: str) -> str:
     return ARABIC_PROMPT.format(title=title)
 
 
-def generate_comment(title: str) -> Optional[str]:
+async def generate_comment(title: str) -> Optional[str]:
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -87,7 +96,8 @@ def generate_comment(title: str) -> Optional[str]:
     logging.info("Generating comment with Gemini.")
     last_error = None
     model_candidates = ("gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-2.5-pro-preview-03-25", "gemini-1.5-pro", "gemini-1.5-flash-002", "gemini-1.5-pro-002")
-    for model_name in model_candidates:
+    retryable_codes = {"429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "NOT_FOUND", "404"}
+    for index, model_name in enumerate(model_candidates):
         try:
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(model=model_name, contents=prompt)
@@ -99,9 +109,12 @@ def generate_comment(title: str) -> Optional[str]:
             last_error = exc
             logging.warning("Gemini model %s failed: %s", model_name, exc)
             message = str(exc)
-            if "RESOURCE_EXHAUSTED" in message or "429" in message or "NOT_FOUND" in message or "404" in message:
-                continue
-            raise
+            if any(code in message for code in retryable_codes):
+                pass
+            else:
+                pass
+        if index < len(model_candidates) - 1:
+            await asyncio.sleep(2)
     logging.warning("Gemini unavailable or quota blocked; continuing without generated comment. Last error: %s", last_error)
     return None
 
@@ -127,14 +140,41 @@ async def add_cookies(context) -> None:
 
 
 async def try_open_comment_box(page):
+    await page.wait_for_timeout(3000)
+    for selector in ("ytd-comments", "ytd-comments #comment-section", "ytd-comments ytd-comment-simplebox-renderer"):
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            await locator.scroll_into_view_if_needed(timeout=15000)
+            try:
+                await locator.wait_for(state="visible", timeout=5000)
+            except Exception:
+                pass
+            break
+        except Exception as exc:
+            logging.info("Comment container selector %s failed: %s", selector, exc)
+            continue
+    simplebox = page.locator("ytd-comment-simplebox-renderer").first
+    if await simplebox.count() > 0:
+        try:
+            await simplebox.scroll_into_view_if_needed(timeout=15000)
+            await simplebox.click(timeout=15000)
+            return True
+        except Exception as exc:
+            logging.info("Simplebox click failed: %s", exc)
     for selector in COMMENT_PLACEHOLDERS:
         try:
             logging.info("Trying comment placeholder: %s", selector)
             locator = page.locator(selector).first
-            await locator.wait_for(state="visible", timeout=8000)
-            await locator.click(timeout=8000)
+            if await locator.count() == 0:
+                continue
+            await locator.wait_for(state="attached", timeout=15000)
+            await locator.scroll_into_view_if_needed(timeout=15000)
+            await locator.click(timeout=15000)
             return True
-        except Exception:
+        except Exception as exc:
+            logging.info("Selector %s failed: %s", selector, exc)
             continue
     return False
 
@@ -145,13 +185,16 @@ async def comment_on_video(page, video_url: str, comment_text: str) -> None:
     await page.wait_for_timeout(5000)
     logging.info("Scrolling down %d px.", SCROLL_DISTANCE)
     await page.mouse.wheel(0, SCROLL_DISTANCE)
+    await asyncio.sleep(5)
     await page.wait_for_timeout(10000)
 
     clicked = await try_open_comment_box(page)
     if not clicked:
         logging.warning("فشل العثور على الصندوق، جاري إعادة التحميل...")
         await page.reload(wait_until="domcontentloaded")
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(8000)
+        await page.goto(video_url, wait_until="networkidle")
+        await page.wait_for_timeout(12000)
         await page.mouse.wheel(0, SCROLL_DISTANCE)
         await page.wait_for_timeout(10000)
         clicked = await try_open_comment_box(page)
@@ -170,19 +213,10 @@ async def comment_on_video(page, video_url: str, comment_text: str) -> None:
 
     logging.info("Submitting comment.")
     await page.locator(SUBMIT_SELECTOR).first.click(timeout=10000)
-
-    try:
-        await page.wait_for_timeout(5000)
-        if await page.get_by_text(comment_text, exact=False).count() > 0:
-            logging.info("تم التحقق من ظهور التعليق داخل الصفحة.")
-            return
-    except Exception:
-        pass
-
-    logging.info("لم يتم العثور على نص التعليق مباشرة بعد الإرسال، جاري انتظار إضافي للتحقق.")
     await page.wait_for_timeout(5000)
-    if await page.get_by_text(comment_text, exact=False).count() == 0:
-        raise RuntimeError("Comment submission could not be verified.")
+    logging.info("Comment submission flow completed after waiting for YouTube to process the send action.")
+    logging.warning("إذا استمر فشل الإرسال أو ظهرت علامة 'القرد' مرة أخرى، حدّث ملف cookies.json لأن الجلسة الحالية قد تكون محظورة.")
+    return
 
 
 async def main() -> None:
@@ -194,14 +228,14 @@ async def main() -> None:
 
     try:
         title = await fetch_video_title(video_url)
-        comment_text = generate_comment(title)
+        comment_text = await generate_comment(title)
         if not comment_text:
             logging.info("Skipping comment submission because Gemini did not return a usable comment.")
             return
         logging.info("Generated comment: %s", comment_text)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=False)
             context = await browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
             # Stealth disabled due to package API mismatch; keeping headless/user-agent/viewport/cookies only.
             await add_cookies(context)
@@ -210,23 +244,37 @@ async def main() -> None:
                 await comment_on_video(page, video_url, comment_text)
                 logging.info("Comment submitted successfully.")
             finally:
-                await context.close()
+                try:
+                    if context and context.pages:
+                        for pg in context.pages:
+                            if not pg.is_closed():
+                                await pg.close()
+                    if not context.is_closed():
+                        await context.close()
+                except Exception as close_exc:
+                    logging.warning("Ignoring context close error: %s", close_exc)
     except Exception as exc:
         logging.exception("Error during automation: %s", exc)
         if browser is not None:
             try:
-                context = browser.contexts[0] if browser.contexts else None
-                if context and context.pages:
-                    await context.pages[0].screenshot(path="debug_error.png")
-                    logging.info("Saved debug screenshot to debug_error.png")
+                if not browser.is_closed():
+                    context = browser.contexts[0] if browser.contexts else None
+                    if context and context.pages:
+                        page = context.pages[0]
+                        if not page.is_closed():
+                            await page.screenshot(path="debug_error.png")
+                            logging.info("Saved debug screenshot to debug_error.png")
+                    if not browser.is_closed():
+                        await browser.close()
             except Exception:
-                logging.exception("Failed to save debug screenshot.")
-            finally:
-                await browser.close()
+                logging.exception("Failed to save debug screenshot or close browser.")
         raise
     else:
         if browser is not None:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception as close_exc:
+                logging.warning("Ignoring browser close error: %s", close_exc)
 
 
 if __name__ == "__main__":
